@@ -223,7 +223,7 @@ python Deterministic_Setting_Gurobi_Model_With_Fixed_Profit.py
 
 ---
 
-## Technical Skills Demonstrated
+## Technical Components
 
 | Category | Details |
 |----------|---------|
