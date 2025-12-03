@@ -1,41 +1,105 @@
+"""
+Myopic Matching Functions for Dynamic Driver-Order Assignment
+
+This module provides core functionality for implementing myopic (greedy) matching
+policies in crowdsourced delivery optimization. It supports:
+
+1. Driver and demand entity management with rich attributes
+2. Priority scoring functions for workforce guarantees (ρ_a, ρ_b)
+3. Linear Programming model setup for real-time matching decisions
+4. Constraint-based optimization with service level guarantees
+
+The myopic policy makes locally optimal decisions at each time epoch without
+considering future state transitions, serving as a baseline for comparison
+with reinforcement learning and lookahead approaches.
+
+Key Concepts:
+    - Driver utilization (bar_ha): Fraction of active time spent on deliveries
+    - Service guarantee (W): Minimum utilization threshold for fair pay
+    - Priority scoring: Incentivizes matching underutilized drivers
+
+Mathematical Notation:
+    - x[a,b]: Binary decision variable (1 if driver a assigned to order b)
+    - ρ_a(bar_ha): Driver priority score based on current utilization
+    - ρ_b(perc): Demand priority based on time-to-deadline proximity
+
+Author: Sahil Bhatt
+"""
+
 import numpy as np
 import math
 from scipy.spatial import distance
 from docplex.mp.model import Model
 import copy
 import random
+from typing import Dict, List, Tuple, Any
 
-# temporary file for modifications to functions file to include possibility of aggregation
-# data =
-# {'t_interval': [], 'h_int': [], 'Guaranteed_service': [], 'gamma': [], 'eta': [], 'W': [], 'T': [], 'delta_t': []}
-# Find closest node from discrete set
 
-def closest_node(node, loc_set):
+def closest_node(node: List[float], loc_set: List[List[float]]) -> List[float]:
+    """
+    Map continuous coordinates to nearest discrete grid point.
+    
+    Args:
+        node: Continuous [x, y] coordinates
+        loc_set: List of valid discrete locations
+        
+    Returns:
+        Nearest location from loc_set to the input node
+    """
     nodes = np.asarray(loc_set)
     closest_ind = distance.cdist([node], nodes).argmin()
     return loc_set[closest_ind]
 
 
-# Driver and demand classes to generate objects
-# Verified for 1. disagg alg, 2.
 class Driver:
-    def __init__(self, number, sa, ma, loc, time_first_matched, ha, bar_ha):
+    """
+    Represents a gig worker (driver) in the crowdsourced delivery system.
+    
+    Attributes:
+        number: Unique identifier for the driver
+        sa: Activity status (1=active in system, 0=inactive)
+        ma: Availability for matching (1=available, 0=currently on delivery)
+        loc: Current [x, y] location coordinates
+        time_first_matched: Timestamp when driver first received an assignment
+        ha: Cumulative active time spent on deliveries (minutes)
+        bar_ha: Utilization rate = ha / total_active_time ∈ [0, 1]
+        iteration_history: Tracking data across simulation iterations
+        
+    The utilization rate (bar_ha) is critical for enforcing minimum wage
+    guarantees - drivers below threshold W receive priority in matching.
+    """
+    
+    def __init__(self, number: int, sa: int, ma: int, loc: List[float],
+                 time_first_matched: float, ha: float, bar_ha: float):
         self.number = number
-        self.sa = sa    # binary=1 if driver active
-        self.ma = ma    # binary=1 if available for matching
-        self.loc = loc  # o_a current location
+        self.sa = sa
+        self.ma = ma
+        self.loc = loc
         self.time_first_matched = time_first_matched
-        self.ha = ha    # active time spent up to t
-        self.bar_ha = bar_ha    # portion of active time driver is utilized
+        self.ha = ha
+        self.bar_ha = bar_ha
         self.iteration_history = {}
 
     def __str__(self):
-        return 'This is driver no. {self.number}'.format(self=self)
+        return f'Driver {self.number}: loc={self.loc}, utilization={self.bar_ha:.2%}'
 
 
-# Verified for 1. disagg alg, 2.
 class Demand:
-    def __init__(self, number, origin, destination, dist, announce_time, delivery_deadline):
+    """
+    Represents a delivery order (demand) in the system.
+    
+    Attributes:
+        number: Unique order identifier
+        origin: Pickup location [x, y]
+        destination: Delivery location [x, y]
+        dst: Euclidean distance from origin to destination
+        announce_time: When the order was placed (continuous time)
+        delivery_deadline: Latest acceptable delivery time
+        iteration_history: Tracking data across simulations
+    """
+    
+    def __init__(self, number: int, origin: List[float], destination: List[float],
+                 dist: float, announce_time: float, delivery_deadline: float):
         self.number = number
         self.origin = origin
         self.destination = destination
@@ -45,58 +109,107 @@ class Demand:
         self.iteration_history = {}
 
     def __str__(self):
-        return 'This is demand no. {self.number}'.format(self=self)
+        return f'Order {self.number}: {self.origin} → {self.destination}'
 
 
-# compute rho_a (priority score)
-def cal_rho_a(bar_ha):
-    # rho_a = [[0, 0.8, 1], [1, 0, 0]]
-    # rho_b = [[[0, 0.24999999], [0.5, 0.5]], [[0.25, 0.5, 1], [0.25, 0, 0]]]
+def cal_rho_a(bar_ha: float) -> float:
+    """
+    Calculate driver priority score based on utilization rate.
+    
+    This piecewise linear function incentivizes matching drivers with
+    low utilization to help them meet minimum guarantee thresholds.
+    
+    Priority Score:
+        - bar_ha < 0.8: ρ_a = -1.25 * bar_ha + 1 (higher priority for underutilized)
+        - bar_ha ≥ 0.8: ρ_a = 0 (no priority boost, guarantee already met)
+    
+    Args:
+        bar_ha: Current driver utilization rate ∈ [0, 1]
+        
+    Returns:
+        Priority score ρ_a ∈ [0, 1], higher = more priority needed
+    """
     if bar_ha < 0.8:
-        rho_a = -1.25 * bar_ha + 1  # eqn of line from above
-        # rho_a = -0.625 * bar_ha + 1  # changed line to be 0.5 penalty at 0.8
-    # elif bar_ha <= 0.9:  # changed 02/09/21
-    #     rho_a = -5*bar_ha + 4.5
-    else:
-        rho_a = 0
-    return rho_a
+        return -1.25 * bar_ha + 1  # Linear decay toward guarantee threshold
+    return 0
 
 
-# compute rho_b (priority score)
-def cal_rho_b(perc):  # perc away from min time window to fulfill order
+def cal_rho_b(perc: float) -> float:
+    """
+    Calculate demand priority score based on delivery urgency.
+    
+    Orders approaching their deadline receive higher priority to ensure
+    timely fulfillment.
+    
+    Priority Score:
+        - perc ≤ 0.25: ρ_b = 0.5 (high urgency, deadline imminent)
+        - perc > 0.5: ρ_b = 0 (low urgency, ample time remaining)
+        - 0.25 < perc ≤ 0.5: ρ_b = -perc + 0.5 (linear interpolation)
+    
+    Args:
+        perc: Percentage of time remaining until deadline
+        
+    Returns:
+        Priority score ρ_b ∈ [0, 0.5], higher = more urgent
+    """
     if perc <= 0.25:
-        rho_b = 0.5
+        return 0.5
     elif perc > 0.5:
-        rho_b = 0
-    else:
-        rho_b = -1 * perc + 0.5  # eqn of line from above points
-    return rho_b
+        return 0
+    return -perc + 0.5
 
 
-# Setup model
-def setup_model(data, t, demand_list, driver_list, driver_attr, demand_attr, penalty):
-    model_name = 'LP_t%d' % t
+def setup_model(data: Dict, t: int, demand_list: Dict, driver_list: Dict,
+                driver_attr: Dict, demand_attr: Dict, penalty: float) -> Tuple:
+    """
+    Set up the Linear Programming model for driver-order matching at epoch t.
+    
+    Formulates the myopic matching optimization:
+        maximize Σ(profit[a,b] - penalty * ρ_a) * x[a,b]
+        subject to:
+            - Each driver assigned at most once
+            - Each order fulfilled at most once
+            - Time window constraints (delivery deadline)
+            - x[a,b] ∈ [0, 1] (LP relaxation)
+    
+    Args:
+        data: Problem parameters (t_interval, W, eta, theta, etc.)
+        t: Current time epoch
+        demand_list: Dictionary of active/fulfilled/expired orders
+        driver_list: Dictionary of available/unavailable drivers
+        driver_attr: Driver attribute objects indexed by ID
+        demand_attr: Demand attribute objects indexed by ID
+        penalty: Weight on guarantee violation penalty term
+        
+    Returns:
+        Tuple of (model, feasibility_dict, time_dict, distance_dict, constraints)
+    """
+    model_name = f'LP_t{t}'
     mdl = Model(name=model_name)
-    # define decision variables: x_tab
+    
+    # Initialize feasibility tracking structures
     x_ab_feasible = {('b', b): [] for b in demand_list['active']}
     x_ab_cost, x_ab_time, x_ab_dist, keys = {}, {}, {}, []
 
     drivers = driver_list['act_available'] + driver_list['inactive']
+    
     for a in drivers:
-        x_ab_feasible[('a', a)] = [0]
+        x_ab_feasible[('a', a)] = [0]  # Can always be "unmatched" (assigned to 0)
         keys.append((a, 0))
         sa = driver_attr[a].sa
+        
+        # Calculate updated utilization if driver remains active
         if sa == 1:
             tot_time = (driver_attr[a].ha / driver_attr[a].bar_ha) + data['t_interval']
             g = max(data['Guaranteed_service'] - ((t + 1) * data['t_interval'] - driver_attr[a].time_first_matched), 0)
             bar_ha_new = round(driver_attr[a].ha / tot_time * 100 / data['h_int']) * data['h_int'] / 100
 
-        # obj func value when unmatched (matched to 0)
+        # Cost for leaving driver unmatched (penalty if guarantee at risk)
         if sa == 0 or (sa == 1 and g > 0) or (sa == 1 and g <= 0 and bar_ha_new >= data['W']):
             x_ab_cost[(a, 0)] = 0
         else:
             rho_a = cal_rho_a(driver_attr[a].bar_ha)
-            x_ab_cost[(a, 0)] = -penalty * rho_a  # penalty = -1000 for high penalty or -1 for regular
+            x_ab_cost[(a, 0)] = -penalty * rho_a
 
         a_loc = tuple(driver_attr[a].loc)
         for b in demand_list['active']:

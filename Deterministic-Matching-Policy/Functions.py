@@ -1,112 +1,284 @@
+"""
+Fleet Size Planning with Wage Guarantee Constraints
+
+This module implements the core algorithms from:
+    "Fleet Size Planning in Crowdsourced Delivery: 
+     Balancing Service Level and Driver Utilization"
+
+THE RESEARCH PROBLEM:
+    Crowdsourced delivery platforms face a fundamental trade-off:
+    - Too many drivers → High demand fulfillment, but drivers are underutilized
+    - Too few drivers → Drivers are busy, but orders go unfulfilled
+    
+    The platform must decide: How many drivers to activate each period?
+    
+    Added complexity: Platforms often guarantee drivers a minimum wage 
+    (e.g., $15/hour), which they achieve if utilization > threshold W (typically 80%).
+
+KEY DECISIONS:
+    1. Pool Size x[p]: How many drivers to invite/activate in period p
+    2. Matching x[a,b]: Which driver a serves which order b
+
+KEY METRICS:
+    1. Service Level: Fraction of demand (orders) fulfilled
+    2. Driver Utilization Rate: (Time spent delivering) / (Total active time)
+    3. Wage Guarantee Rate: Fraction of drivers meeting utilization threshold W
+
+ALGORITHMS IMPLEMENTED:
+
+    1. Softmax (Boltzmann) Policy for Pool Sizing:
+       - Learn optimal pool sizes through value function V[period, size]
+       - Temperature annealing for exploration-exploitation balance
+       - See function: boltzmann()
+
+    2. Utilization-Aware Matching:
+       - LP assigns drivers to orders in real-time
+       - Priority score ρ_a gives preference to underutilized drivers
+       - Helps drivers meet wage guarantee threshold
+       - See function: solve_opt(), cal_rho_a()
+
+    3. Stochastic Simulation:
+       - Poisson demand arrivals with rate λ
+       - Binomial driver arrivals from pool
+       - See function: sample_path()
+
+DATA STRUCTURES:
+    - Driver: Tracks location, utilization, earnings, availability
+    - Demand: Tracks origin/destination, deadline, value
+    - Value function V[(period, pool_size)] → expected profit
+
+Dependencies:
+    - gurobipy: LP solver for matching optimization
+    - numpy, scipy: Numerical computing and distance calculations
+    
+Author: Sahil Bhatt
+"""
+
 import numpy as np
 import math
 from scipy.spatial import distance
-from gurobipy import * 
-from scipy.spatial import distance
-from scipy.spatial.distance import euclidean 
+from gurobipy import *
+from scipy.spatial.distance import euclidean
 import copy
 import random
- 
+from typing import Dict, List, Tuple, Any
 
-def boltzmann(V, iter):  
+
+def boltzmann(V: Dict, iteration: int) -> List[int]:
     """
-    Using the value function (V), which determines the value associated with setting a particular pool size
-    at a particular period, determines, using a softmax policy, the pool size at each period
-    The softmax policy is more stable and smooth as it chooses pool sizes probabilistically, avoiding the nonlinearity 
-    and instability of approaches such as epsilon greedy 
-    """ 
-    n = 16; x_hat_star = [0 for i in range(n)] 
+    Softmax (Boltzmann) policy for pool size selection.
     
-    upper_limit = 55 
+    This is the KEY DECISION mechanism for fleet size planning.
+    Instead of using a fixed pool size, we learn which pool sizes
+    work best for each planning period through the value function V.
     
-    for j in range(n): 
-        d = max([V[(j,k)] for k in range(1, upper_limit+1)]) + 0.0001 - min([V[(j,k)] for k in range(1, upper_limit+1)])
-         
-        zeta = iter/(10*d)   
+    The Policy:
+        P(pool_size = k | period = j) ∝ exp(-ζ * V[j,k])
         
-        W = 0; w = [0 for i in range(upper_limit)]
-
-        for k in range(1, upper_limit+1):
-            w[k-1] = math.exp(-zeta*V[(j, k)])
-            W+=w[k-1] 
-
-        u = np.random.uniform(0,W); u = random.random()*W 
+    where:
+        - V[j,k] = expected cost/regret of choosing pool size k in period j
+        - ζ (zeta) = temperature parameter controlling exploration
+        - Lower V[j,k] → higher probability of selecting k
     
-        wtemp = 0; k = 0
-
-        while True: 
-            wtemp+=w[k]
+    Temperature Annealing:
+        - Early iterations: High temperature → explore many pool sizes
+        - Later iterations: Low temperature → exploit best-performing sizes
+        - Formula: ζ = iteration / (10 * value_range)
+    
+    Why Softmax over ε-greedy?
+        - Smoother exploration across action space
+        - Naturally handles continuous-like pool size ranges
+        - Better convergence properties for this problem
+    
+    Args:
+        V: Value function dictionary V[period, pool_size] → expected cost
+           Learned through simulation iterations
+        iteration: Current training iteration (controls temperature)
+        
+    Returns:
+        List of 16 pool sizes, one for each planning period
+        Values range from 1 to 55 drivers
+        
+    Example:
+        >>> V = {(p, k): some_cost for p in range(16) for k in range(1, 56)}
+        >>> pool_sizes = boltzmann(V, iteration=100)
+        >>> print(pool_sizes)  # e.g., [25, 30, 35, 40, 42, 38, ...]
+    """
+    num_periods = 16
+    x_hat_star = [0] * num_periods
+    upper_limit = 55  # Maximum pool size
+    
+    for j in range(num_periods):
+        # Calculate temperature based on value function range
+        v_max = max(V[(j, k)] for k in range(1, upper_limit + 1))
+        v_min = min(V[(j, k)] for k in range(1, upper_limit + 1))
+        d = v_max + 0.0001 - v_min  # Value range (avoid division by zero)
+        
+        # Temperature decreases with iteration (annealing schedule)
+        zeta = iteration / (10 * d)
+        
+        # Compute Boltzmann weights
+        W = 0
+        w = [0] * upper_limit
+        
+        for k in range(1, upper_limit + 1):
+            w[k - 1] = math.exp(-zeta * V[(j, k)])
+            W += w[k - 1]
+        
+        # Sample action proportional to weights
+        u = random.random() * W
+        
+        wtemp = 0
+        k = 0
+        while True:
+            wtemp += w[k]
             if wtemp >= u:
-                break 
-            k+=1 
+                break
+            k += 1
             
-        x_hat_star[j] = 1+k  
+        x_hat_star[j] = 1 + k
+        
+    return x_hat_star
 
-    return x_hat_star 
 
-def closest_node(node, loc_set):
+def closest_node(node: List[float], loc_set: List[List[float]]) -> List[float]:
+    """Map continuous coordinates to nearest discrete grid point."""
     nodes = np.asarray(loc_set)
     closest_ind = distance.cdist([node], nodes).argmin()
     return loc_set[closest_ind]
- 
-# Generate a random sample path for 1 iteration
-# Verified for 1. disagg alg, 2.
-def sample_path(mu_enter, mu_exit, lambd, grid_size, t_interval, T, loc_set, num_drivers_enter):
-    # select sample path
-    m_n = {}
-    d_n = {}
-    for t in range(T):
-        m_t = num_drivers_enter[t]  # realization of random driver entrance
-        m_n[t] = m_t 
 
-        # stopped here 11/25/20 7:27 am
+
+def sample_path(mu_enter: float, mu_exit: float, lambd: float,
+                grid_size: Tuple[int, int], t_interval: float, T: int,
+                loc_set: List, num_drivers_enter: List[int]) -> Tuple[Dict, Dict]:
+    """
+    Generate a sample path (trajectory) for one simulation iteration.
+    
+    Simulates the arrival of demand (orders) and drivers over T time epochs
+    following Poisson processes. This creates a stochastic scenario for
+    evaluating workforce scheduling policies.
+    
+    Args:
+        mu_enter: Mean driver arrival rate (not used - controlled externally)
+        mu_exit: Mean driver departure rate (not used here)
+        lambd: Mean demand arrival rate per epoch (Poisson parameter)
+        grid_size: (width, height) of the service region
+        t_interval: Duration of each time epoch (minutes)
+        T: Total number of epochs in planning horizon
+        loc_set: List of valid discrete locations
+        num_drivers_enter: Pre-specified driver arrivals per epoch
+        
+    Returns:
+        Tuple of (demand_dict, driver_dict) containing sample path data
+    """
+    m_n = {}  # Driver sample path
+    d_n = {}  # Demand sample path
+    
+    for t in range(T):
+        # Driver arrivals (controlled by pool sizing decisions)
+        m_t = num_drivers_enter[t]
+        m_n[t] = m_t
+
         if m_t > 0:
             for i in range(m_t):
-                # set random location of drivers on 10x10 grid
-                m_n[t, i] = closest_node([np.random.uniform(0, grid_size[0]), np.random.uniform(0, grid_size[1])],
-                                         loc_set)
+                # Random location on grid
+                m_n[t, i] = closest_node(
+                    [np.random.uniform(0, grid_size[0]),
+                     np.random.uniform(0, grid_size[1])],
+                    loc_set
+                )
 
-        # Demand info
+        # Demand arrivals (Poisson process)
         d_t = np.random.poisson(lambd)
         d_n[t] = d_t
+        
         if d_t > 0:
             for i in range(d_t):
-                # set random origin and destination locations of drivers on 10x10 grid,
-                # random announcement time between 2 epochs
-                o_discrete = closest_node([np.random.uniform(0, grid_size[0]), np.random.uniform(0, grid_size[1])],
-                                          loc_set)
-                d_discrete = closest_node([np.random.uniform(0, grid_size[0]), np.random.uniform(0, grid_size[1])],
-                                          loc_set)
-                while o_discrete == d_discrete:  # to make sure origin != dest
-                    d_discrete = closest_node([np.random.uniform(0, grid_size[0]), np.random.uniform(0, grid_size[1])],
-                                              loc_set)
-                value_d = np.random.uniform(3, 12)  # 30% of the value of meal, meal value U[10,40]
-                d_n[t, i] = [[o_discrete, d_discrete],
-                             np.random.uniform(max(0, (t - 1)) * t_interval, t * t_interval), value_d]
+                # Generate origin-destination pair
+                origin = closest_node(
+                    [np.random.uniform(0, grid_size[0]),
+                     np.random.uniform(0, grid_size[1])],
+                    loc_set
+                )
+                destination = closest_node(
+                    [np.random.uniform(0, grid_size[0]),
+                     np.random.uniform(0, grid_size[1])],
+                    loc_set
+                )
+                
+                while origin == destination:
+                    destination = closest_node(
+                        [np.random.uniform(0, grid_size[0]),
+                         np.random.uniform(0, grid_size[1])],
+                        loc_set
+                    )
+                
+                # Order value ~ U[3, 12] representing delivery fee
+                value_d = np.random.uniform(3, 12)
+                announce_time = np.random.uniform(
+                    max(0, (t - 1)) * t_interval,
+                    t * t_interval
+                )
+                
+                d_n[t, i] = [[origin, destination], announce_time, value_d]
 
-    return d_n, m_n 
+    return d_n, m_n
 
-# Driver and demand classes to generate objects
-# Verified for 1. disagg alg, 2.
+
 class Driver:
-    def __init__(self, number, ma, loc, time_entered, exit_time, ha, bar_ha, profit_matching):
-        self.number = number 
-        self.ma = ma    # binary=1 if available for matching
-        self.loc = loc  # o_a current location 
-        self.ha = ha    # active time spent up to t
-        self.bar_ha = bar_ha    # portion of active time driver is utilized
+    """
+    Gig worker (driver) entity for workforce scheduling.
+    
+    Tracks driver state including availability, location, utilization,
+    and earnings for enforcing minimum wage guarantees.
+    
+    Attributes:
+        number: Unique driver identifier
+        ma: Availability status (1=available for matching)
+        loc: Current [x, y] location
+        time_entered: When driver joined the platform
+        exit_time: Planned departure time
+        ha: Cumulative active/working time
+        bar_ha: Utilization rate = working_time / total_time
+        profit_matching: Cumulative earnings from deliveries
+    """
+    
+    def __init__(self, number: int, ma: int, loc: List[float],
+                 time_entered: float, exit_time: float,
+                 ha: float, bar_ha: float, profit_matching: float):
+        self.number = number
+        self.ma = ma
+        self.loc = loc
+        self.ha = ha
+        self.bar_ha = bar_ha
         self.profit_matching = profit_matching
         self.active_history = []
         self.iteration_history = {}
         self.time_entered = time_entered
-        self.exit_time = min(exit_time, 192) 
+        self.exit_time = min(exit_time, 192)  # Cap at planning horizon
 
     def __str__(self):
-        return 'This is driver no. {self.number}'.format(self=self)
- 
-# Verified for 1. disagg alg, 2.
+        return f'Driver {self.number}: utilization={self.bar_ha:.2%}'
+
+
 class Demand:
-    def __init__(self, number, origin, destination, dist, announce_time, placement_time, delivery_deadline, value):
+    """
+    Delivery order entity with time window constraints.
+    
+    Attributes:
+        number: Unique order identifier
+        origin: Pickup location
+        destination: Delivery location
+        dst: Euclidean distance (origin to destination)
+        announce_time: When order was placed
+        placement_time: Epoch when order entered system
+        delivery_deadline: Latest acceptable delivery time
+        value: Revenue for completing this order
+    """
+    
+    def __init__(self, number: int, origin: List[float], destination: List[float],
+                 dist: float, announce_time: float, placement_time: float,
+                 delivery_deadline: float, value: float):
         self.number = number
         self.origin = origin
         self.destination = destination
@@ -118,37 +290,59 @@ class Demand:
         self.placement_time = placement_time
 
     def __str__(self):
-        return 'This is demand no. {self.number}'.format(self=self)
-  
-# compute rho_a (priority score)
-def cal_rho_a(bar_ha):
-    # rho_a = [[0, 0.8, 1], [1, 0, 0]]
-    # rho_b = [[[0, 0.24999999], [0.5, 0.5]], [[0.25, 0.5, 1], [0.25, 0, 0]]]
+        return f'Order {self.number}: ${self.value:.2f}'
+
+
+def cal_rho_a(bar_ha: float) -> float:
+    """
+    Calculate driver priority score based on utilization.
+    
+    Priority function incentivizes matching underutilized drivers
+    to help them meet minimum guarantee thresholds (W = 0.8).
+    
+    Args:
+        bar_ha: Current driver utilization ∈ [0, 1]
+        
+    Returns:
+        Priority score ρ_a ∈ [0, 1]
+    """
     if bar_ha < 0.8:
-        rho_a = -1.25 * bar_ha + 1  # eqn of line from above
-        # rho_a = -0.625 * bar_ha + 1  # changed line to be 0.5 penalty at 0.8  # changed for rho_a_v2
-    else:
-        rho_a = 0
-    return rho_a 
+        return -1.25 * bar_ha + 1
+    return 0
 
-# compute rho_b (priority score)
-def cal_rho_b(perc):  # perc away from min time window to fulfill order
+
+def cal_rho_b(perc: float) -> float:
+    """
+    Calculate demand priority based on deadline urgency.
+    
+    Args:
+        perc: Fraction of time remaining until deadline
+        
+    Returns:
+        Priority score ρ_b ∈ [0, 0.5]
+    """
     if perc <= 0.25:
-        rho_b = 0.5
+        return 0.5
     elif perc > 0.5:
-        rho_b = 0
-    else:
-        rho_b = -1 * perc + 0.5  # eqn of line from above points
-    return rho_b 
+        return 0
+    return -perc + 0.5
 
-def cal_theta(dist):
+
+def cal_theta(dist: float) -> float:
+    """
+    Distance-based delivery fee scaling.
+    
+    Args:
+        dist: Delivery distance
+        
+    Returns:
+        Fee rate multiplier
+    """
     if dist < 2:
-        theta = 4
+        return 4
     elif dist < 5:
-        theta = 6
-    else:
-        theta = 7
-    return theta
+        return 6
+    return 7
     
 def solve_opt(data, t, n, demand_list, driver_list, driver_attr, demand_attr, penalty):
     model_name = 'LP_t%d_n%d' % (t, n)

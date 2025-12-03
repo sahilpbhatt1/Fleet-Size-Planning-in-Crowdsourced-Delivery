@@ -1,34 +1,125 @@
+"""
+Fleet Size Planning: Main Simulation and Evaluation Module
+
+This is the MAIN EXECUTION module for:
+    "Fleet Size Planning in Crowdsourced Delivery: 
+     Balancing Service Level and Driver Utilization"
+
+WHAT THIS CODE DOES:
+    Runs N simulation iterations to evaluate and learn pool sizing policies.
+    Each iteration simulates a full day (16 hours = 192 five-minute epochs)
+    of platform operations.
+
+SIMULATION FLOW (each iteration):
+    
+    For each period p = 1 to 16 (each period = 12 epochs = 1 hour):
+        
+        1. POOL SIZE DECISION
+           - Use Softmax policy to select pool size x[p]
+           - Higher pool → more drivers available → better service
+           - Lower pool → fewer drivers → better utilization per driver
+        
+        2. DRIVER ARRIVALS
+           - Drivers join with probability prob_enter
+           - Actual arrivals ~ Binomial(pool_size, prob_enter)
+        
+        3. For each epoch t in period p:
+           
+           a. DEMAND ARRIVALS
+              - New orders arrive ~ Poisson(λ)
+              - Each order has origin, destination, value, deadline
+           
+           b. MATCHING OPTIMIZATION
+              - Solve LP: assign available drivers to active orders
+              - Objective includes:
+                • Platform profit (order value - delivery cost)
+                • Utilization incentive ρ_a (prioritize underutilized drivers)
+              - Constraints:
+                • Each driver serves at most one order
+                • Each order served by at most one driver
+                • Delivery must complete before deadline
+           
+           c. STATE UPDATE
+              - Update driver locations (to delivery destination)
+              - Update driver utilization (ha / total_time)
+              - Track earnings toward wage guarantee
+              - Remove expired orders
+        
+        4. END-OF-PERIOD TRACKING
+           - Which drivers exited? Did they meet wage guarantee?
+           - Update statistics
+
+OUTPUT METRICS:
+    - Fraction of demand fulfilled (service level)
+    - Fraction of drivers meeting wage guarantee
+    - Driver utilization distribution
+    - Objective value (platform profit + utilization incentives)
+
+The simulation provides estimates of:
+    E[Service Level | pool_sizes] 
+    E[Wage Guarantee Rate | pool_sizes]
+
+These are used to update the value function V and improve the pool sizing policy.
+
+Author: Sahil Bhatt
+"""
+
 from __future__ import print_function
-from gurobipy import * 
+from gurobipy import *
 from scipy.spatial import distance
-from scipy.spatial.distance import euclidean 
+from scipy.spatial.distance import euclidean
 import math
-import numpy as np 
+import numpy as np
 from time import time
-import Functions as func 
+import Functions as func
 from collections import defaultdict
 import bisect
 
 from scipy.stats import t
 
-def confidence_interval(data, confidence=0.95):
+
+def confidence_interval(data: list, confidence: float = 0.95) -> None:
+    """
+    Compute and display confidence interval for simulation results.
+    
+    After N simulation iterations, we have N observations of each metric.
+    This function computes a 95% confidence interval for the true mean,
+    which tells us: "We're 95% confident the true value lies in this range."
+    
+    Uses t-distribution (appropriate for small N with unknown variance).
+    
+    Args:
+        data: List of N observations (e.g., utilization rates from N iterations)
+        confidence: Confidence level (default 0.95 for 95% CI)
+        
+    Prints:
+        - Mean: Point estimate of the metric
+        - Std Dev: Variability across iterations
+        - 95% CI: Range likely to contain true mean
+        - CV: Coefficient of variation (relative variability)
+    """
     n = len(data)
     mean = np.mean(data)
     std_err = np.std(data, ddof=1) / np.sqrt(n)
     t_val = t.ppf((1 + confidence) / 2, n - 1)
     margin_of_error = t_val * std_err
     lower_bound = mean - margin_of_error
-    upper_bound = mean + margin_of_error 
+    upper_bound = mean + margin_of_error
 
     mean_reward = np.mean(data)
-    std_dev = np.std(data, ddof=1) 
-    print("Mean:", mean_reward)
-    print("Standard Deviation:", std_dev)
-    print("95% Confidence Interval: [{:.2f}, {:.2f}]".format(lower_bound, upper_bound)) 
-    print("Coefficient of Variation: ", std_dev/mean_reward) 
+    std_dev = np.std(data, ddof=1)
+    
+    print("=" * 50)
+    print("STATISTICAL SUMMARY")
+    print("=" * 50)
+    print(f"Mean: {mean_reward:.4f}")
+    print(f"Standard Deviation: {std_dev:.4f}")
+    print(f"95% Confidence Interval: [{lower_bound:.4f}, {upper_bound:.4f}]")
+    print(f"Coefficient of Variation: {std_dev/mean_reward:.4f}")
 
 
-class color:
+class Color:
+    """ANSI color codes for terminal output formatting."""
     PURPLE = '\033[95m'
     CYAN = '\033[96m'
     DARKCYAN = '\033[36m'
@@ -40,58 +131,87 @@ class color:
     UNDERLINE = '\033[4m'
     END = '\033[0m'
 
-# (timestamp: 02/05/21) Not sure why the code is a bit slow as we progress in t
-# next: update codes of test instances to get those functions.
-# Step 3: run algorithm
-def iterate(data, d, penalty, pool_sizes, V, alpha):
-    # Step 3.1: while n <= N
-    driver_attr, demand_attr = {}, {}
 
+def iterate(data: dict, d: dict, penalty: float, pool_sizes: list,
+            V: dict, alpha: float) -> tuple:
+    """
+    Main training/evaluation loop for workforce scheduling policy.
+    
+    Iterates through N simulation runs, each consisting of:
+    1. Generate driver arrivals based on pool sizing decisions
+    2. Simulate demand arrivals (Poisson process)
+    3. Solve matching optimization at each epoch
+    4. Update driver/demand state
+    5. Track performance metrics
+    
+    Args:
+        data: Problem parameters dictionary containing:
+            - T: Planning horizon (epochs)
+            - t_interval: Epoch duration (minutes)
+            - W: Minimum utilization guarantee threshold
+            - train_N/test_N: Number of iterations
+            - Other model parameters
+        d: Pre-generated demand scenarios
+        penalty: Objective function penalty weight
+        pool_sizes: List of pool sizes for each period
+        V: Value function dictionary (for softmax policy)
+        alpha: Learning rate (not used in evaluation mode)
+        
+    Returns:
+        Tuple of performance statistics
+    """
+    # Initialize tracking structures
+    driver_attr, demand_attr = {}, {}
     obj_val, obj_val_list = {}, []
-    # driver attribute a= (sa, ma, oa, time_first_matched, ha, \bar{ha})
-    # demand attribute b = (ob, db, dst, (tbmin, tbmax))
+    
     t_training_begin = time()
     
-    m = {} #We do not store driver data, only demand data, because the number of drivers that enter is subject to endogenous uncertainty
+    # Driver arrivals are endogenous (controlled by pool sizing)
+    m = {}
     
-    av_fraction_demand_met = [0 for i in range(16)]
-    av_fraction_meeting_guarantee = [0 for i in range(16)]
+    # Per-period tracking
+    av_fraction_demand_met = [0] * 16
+    av_fraction_meeting_guarantee = [0] * 16
     
+    # Aggregate tracking
     overall_fraction_demand_met = []
     overall_fraction_meeting_guarantee = []
     overall_bar_ha = []
-
+    
+    # Utilization distribution buckets
     bucket_ranges = [0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 1]
-
-    buckets = {x:0 for x in bucket_ranges}
-
-    if data['train']: 
-        N = data['train_N']
-    else: 
-        N = data['test_N'] 
-
+    buckets = {x: 0 for x in bucket_ranges}
+    
+    # Determine number of iterations based on mode
+    N = data['train_N'] if data['train'] else data['test_N']
+    
     for n in range(1, N):
-        driver_stats = {'guarantee_met':[], 'guarantee_missed':[]}; 
-        demand_stats = {'met':[], 'missed':[]}; 
+        # Initialize statistics collectors
+        driver_stats = {'guarantee_met': [], 'guarantee_missed': []}
+        demand_stats = {'met': [], 'missed': []}
         driver_log = {}
-
-        print('\n' + color.BOLD + color.RED + 'N IS EQUAL TO: ', n, color.END); print()
-
-        obj_val[n] = 0
-        driver_list = {'available': [], 'unavailable': [],  'exit': []}
-        demand_list = {'active': [], 'fulfilled': [], 'expired': []}  
-
-        num_drivers_enter = [0 for t in range(data['T'])]
-         
-        for p in range(16):
-            num_drivers_enter[12*p] = np.random.binomial(pool_sizes[p], data['prob_enter'])
-
-        num_drivers_enter
-        _, m[n] = func.sample_path(data['mu_enter'], data['mu_exit'], data['lambd'],
-                                      data['grid_size'], data['t_interval'], data['T'], data['loc_set_0'], num_drivers_enter)
-
         
-        # driver numbering restarts each iteration. Active available drivers are moved forward but re-numbered
+        print(f'\n{Color.BOLD}{Color.RED}ITERATION {n}{Color.END}')
+        
+        obj_val[n] = 0
+        driver_list = {'available': [], 'unavailable': [], 'exit': []}
+        demand_list = {'active': [], 'fulfilled': [], 'expired': []}
+        
+        # Generate driver arrivals based on pool sizing policy
+        num_drivers_enter = [0] * data['T']
+        for p in range(16):
+            num_drivers_enter[12 * p] = np.random.binomial(
+                pool_sizes[p], data['prob_enter']
+            )
+        
+        # Generate sample path for this iteration
+        _, m[n] = func.sample_path(
+            data['mu_enter'], data['mu_exit'], data['lambd'],
+            data['grid_size'], data['t_interval'], data['T'],
+            data['loc_set_0'], num_drivers_enter
+        )
+        
+        # Process each epoch
         for t in range(data['T']):
             #print("n = %d, t = %d" % (n, t))
             if t == 0:
